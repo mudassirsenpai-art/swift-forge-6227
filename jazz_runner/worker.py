@@ -86,14 +86,15 @@ async def main():
 
         loop = asyncio.get_event_loop()
         target = payload["parent_id"]
-        if is_batch:
+        new_folder = bool(payload.get("new_folder", is_batch))
+        if new_folder:
             target = await loop.run_in_executor(
                 None, core.create_cloud_folder, batch_name, payload["parent_id"], cookies, key
             )
 
         await core.run_pipeline(
             client, user_id, job_id, items, target, is_batch, batch_name, cookies, key,
-            status_msg=status_msg,
+            status_msg=status_msg, dest_path=payload.get("dest_path", "/"), new_folder=new_folder,
         )
     except Exception as e:
         failed = True
