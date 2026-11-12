@@ -1455,7 +1455,7 @@ def pack_blocks(blocks, limit=TG_MSG_LIMIT):
         msgs.append(cur)
     return msgs
 
-def build_final_messages(tasks, is_batch, batch_name, folder_link=None, folder_link_id=None):
+def build_final_messages(tasks, is_batch, batch_name, folder_link=None, folder_link_id=None, dest_path="/", new_folder=None):
     """Pura final result -> messages ki list (har ek <= 4000 chars)."""
     total = len(tasks)
     ok = sum(1 for t in tasks.values() if task_is_ok(t))
@@ -1466,9 +1466,12 @@ def build_final_messages(tasks, is_batch, batch_name, folder_link=None, folder_l
         title = "⚠️ **Upload Failed**"
     else:
         title = "🏁 **Upload Finished — Some Items Need Attention**"
+    if new_folder is None: new_folder = is_batch
+    full_path = (dest_path.rstrip("/") + "/" + batch_name) if new_folder else (dest_path or "/")
     head = title + "\n"
-    if is_batch:
+    if new_folder:
         head += f"📁 **Folder:** `{batch_name}`\n"
+    head += f"📍 **Uploaded to:** `{full_path}`\n"
     head += f"{RULE_LINE}\n✅ {ok} of {total} file{'s' if total != 1 else ''} completed"
     if ok < total:
         head += f" · ⚠️ {total - ok} not completed"
@@ -1476,11 +1479,11 @@ def build_final_messages(tasks, is_batch, batch_name, folder_link=None, folder_l
     for tid, t in tasks.items():
         blocks += render_task_blocks(tid, t)
     foot = ""
-    if is_batch and folder_link:
+    if new_folder and folder_link:
         foot = f"{RULE_LINE}\n🔗 **All Files Share Link (Folder):**\n{folder_link}"
         if folder_link_id:
             foot += f"\n🔑 **Unshare:** `/unsharefo {folder_link_id}`"
-    elif is_batch:
+    elif new_folder:
         foot = f"{RULE_LINE}\n⚠️ **Folder share link could not be generated.**"
     if foot:
         blocks.append(foot)
@@ -2108,14 +2111,15 @@ async def main():
 
         loop = asyncio.get_event_loop()
         target = payload["parent_id"]
-        if is_batch:
+        new_folder = bool(payload.get("new_folder", is_batch))
+        if new_folder:
             target = await loop.run_in_executor(
                 None, core.create_cloud_folder, batch_name, payload["parent_id"], cookies, key
             )
 
         await core.run_pipeline(
             client, user_id, job_id, items, target, is_batch, batch_name, cookies, key,
-            status_msg=status_msg,
+            status_msg=status_msg, dest_path=payload.get("dest_path", "/"), new_folder=new_folder,
         )
     except Exception as e:
         failed = True
@@ -2561,7 +2565,7 @@ async def gh_text_input(client, message, state):
 
 gh_user_locks = {}    # user_id -> Lock  (ek user ki ek waqt me sirf ek GitHub job)
 
-async def gh_try_dispatch(client, user_id, job_id, tasks_list, folder_id, is_batch, batch_name, cookies, key):
+async def gh_try_dispatch(client, user_id, job_id, tasks_list, folder_id, is_batch, batch_name, cookies, key, dest_path="/", new_folder=None):
     """GitHub mode ON ho to job queue me daalo (har user ki ek waqt me ek job). True = GitHub flow ne le liya."""
     cfg = gh_load()
     if not gh_mode_on(cfg):
@@ -2577,10 +2581,11 @@ async def gh_try_dispatch(client, user_id, job_id, tasks_list, folder_id, is_bat
                        "run_id": None, "url": "", "cancel_requested": False, "lock_held": False, "client": client}
     for idx in range(len(items)):
         gh_task_index[f"t{job_id[:3]}{idx}"] = job_id
-    asyncio.create_task(gh_job_runner(client, user_id, job_id, items, tasks_list, folder_id, is_batch, batch_name, cookies, key, status_msg))
+    asyncio.create_task(gh_job_runner(client, user_id, job_id, items, tasks_list, folder_id, is_batch, batch_name, cookies, key, status_msg, dest_path, new_folder))
     return True
 
-async def gh_job_runner(client, user_id, job_id, items, tasks_list, folder_id, is_batch, batch_name, cookies, key, status_msg):
+async def gh_job_runner(client, user_id, job_id, items, tasks_list, folder_id, is_batch, batch_name, cookies, key, status_msg, dest_path="/", new_folder=None):
+    if new_folder is None: new_folder = is_batch
     job = gh_jobs.get(job_id)
     if not job: return
     lock = gh_user_locks.setdefault(user_id, asyncio.Lock())
@@ -2596,6 +2601,7 @@ async def gh_job_runner(client, user_id, job_id, items, tasks_list, folder_id, i
         else:
             payload = {"user_id": user_id, "job_id": job_id, "batch_name": batch_name, "is_batch": is_batch,
                        "parent_id": folder_id, "items": items, "cookies": cookies, "key": key,
+                       "dest_path": dest_path, "new_folder": bool(new_folder),
                        "conc": int(cfg.get("parallel", 5)), "status_msg_id": status_msg.id}
             try:
                 from cryptography.fernet import Fernet
@@ -2619,8 +2625,9 @@ async def gh_job_runner(client, user_id, job_id, items, tasks_list, folder_id, i
             except Exception: pass
             await client.send_message(user_id, f"⚠️ {fallback_reason} — running on hosting instead.")
             loop = asyncio.get_event_loop()
-            target = await loop.run_in_executor(None, create_cloud_folder, batch_name, folder_id, cookies, key) if is_batch else folder_id
-            return await run_pipeline(client, user_id, job_id, tasks_list, target, is_batch, batch_name, cookies, key)
+            target = await loop.run_in_executor(None, create_cloud_folder, batch_name, folder_id, cookies, key) if new_folder else folder_id
+            return await run_pipeline(client, user_id, job_id, tasks_list, target, is_batch, batch_name, cookies, key,
+                                      dest_path=dest_path, new_folder=new_folder)
         try:
             await status_msg.edit_text(f"🐙 **GitHub runner starting...**\n├ Job: `{job_id}` · {len(items)} file(s)\n└ Progress will show here in ~1 min.")
         except Exception: pass
@@ -3260,12 +3267,10 @@ async def end_cmd(client, message):
         return await message.reply("❌ Use `/mgen` first.")
         
     job_data = {"start_msg_id": user_pending_jobs[message.from_user.id].pop("mgen_start"), "end_msg_id": message.reply_to_message.id, "is_batch": True}
-    user_states[message.from_user.id] = {"action": "WAITING_FOR_BATCH_NAME", "data": job_data}
-    
     try: await message.delete()
     except Exception: pass
     
-    await message.reply("✅ Mapped. Reply with **folder name**:")
+    await ask_folder_choice(message, message.from_user.id, job_data, "✅ **Files mapped.**")
 
 @app.on_message(filters.command("upload") & filters.reply)
 async def upload_single(client, message):
@@ -3348,12 +3353,10 @@ async def mlink_cmd(client, message):
     if not links_data: 
         return await message.reply("❌ No valid links found in your message.")
     
-    user_states[message.from_user.id] = {"action": "WAITING_FOR_BATCH_NAME", "data": {"is_batch": True, "links": links_data}}
-    
     try: await message.delete()
     except Exception: pass
     
-    await message.reply(f"✅ **{len(links_data)} links detected.**\nReply with a **folder name** for this batch:")
+    await ask_folder_choice(message, message.from_user.id, {"is_batch": True, "links": links_data}, f"✅ **{len(links_data)} links detected.**")
 
 @app.on_message(filters.text & filters.private)
 async def text_handler(client, message):
@@ -3404,6 +3407,39 @@ async def text_handler(client, message):
         # Folder banne ke baad dobara menu show karo
         await check_login_and_ask_folder(client, message, user_id, job_data)
 
+async def ask_folder_choice(message, user_id, job_data, title):
+    """Batch (/mgen, /mlink) ke baad: naya folder banana hai ya existing folder me seedha upload?"""
+    cid = str(uuid.uuid4())[:8]
+    user_pending_jobs.setdefault(user_id, {})[cid] = job_data
+    text = (
+        f"{title}\n\n"
+        "What would you like to do?\n\n"
+        "✏️ **Name a Folder** — a new folder is created with the name you send, and all files are uploaded inside it.\n\n"
+        "⏭ **Skip** — no new folder is created; files are uploaded directly into an existing folder that you pick next."
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Name a Folder", callback_data=f"bn_name_{cid}")],
+        [InlineKeyboardButton("⏭ Skip — Use Existing Folder", callback_data=f"bn_skip_{cid}")],
+    ])
+    await message.reply(text, reply_markup=markup)
+
+@app.on_callback_query(filters.regex(r"^bn_"))
+async def folder_choice_callback(client, query):
+    user_id = query.from_user.id
+    if user_id not in allowed_users: return await query.answer("Unauthorized", show_alert=True)
+    _, action, cid = query.data.split("_", 2)
+    job_data = user_pending_jobs.get(user_id, {}).pop(cid, None)
+    if not job_data: return await query.answer("⚠️ Session expired.", show_alert=True)
+    await query.answer()
+    if action == "name":
+        user_states[user_id] = {"action": "WAITING_FOR_BATCH_NAME", "data": job_data}
+        return await query.message.edit_text("✏️ **Send the folder name:**")
+    job_data["batch_name"] = "Existing folder"
+    job_data["skip_folder"] = True
+    try: await query.message.delete()
+    except Exception: pass
+    await check_login_and_ask_folder(client, query.message, user_id, job_data)
+
 async def check_login_and_ask_folder(client, message, user_id, job_data):
     cookies, key = load_cookies(user_id)
     if not key: return await message.reply("❌ Please `/login` first.")
@@ -3415,6 +3451,7 @@ async def check_login_and_ask_folder(client, message, user_id, job_data):
 
     job_id = str(uuid.uuid4())[:8]
     if user_id not in user_pending_jobs: user_pending_jobs[user_id] = {}
+    job_data["dest_names"] = {str(root_id): "/", **{str(fid): f"/{fname}" for fname, fid in folders}}
     user_pending_jobs[user_id][job_id] = job_data
 
     # --- NEW: Added Create Folder Button ---
@@ -3430,7 +3467,13 @@ async def check_login_and_ask_folder(client, message, user_id, job_data):
             row = []
     if row: buttons.append(row)
     
-    await msg.edit(f"✅ Select destination for **{job_data['batch_name']}**:", reply_markup=InlineKeyboardMarkup(buttons))
+    if job_data.get("skip_folder"):
+        prompt = "✅ Select the **existing folder** to upload your files into:"
+    elif job_data.get("is_batch"):
+        prompt = f"✅ Select where to create the new folder **{job_data['batch_name']}**:"
+    else:
+        prompt = f"✅ Select destination for **{job_data['batch_name']}**:"
+    await msg.edit(prompt, reply_markup=InlineKeyboardMarkup(buttons))
 
 # --- NEW: Create Folder UI Callbacks ---
 @app.on_callback_query(filters.regex(r"^(createnewfol_|cancelnewfol_)"))
@@ -3489,18 +3532,23 @@ async def folder_selected(client, query):
 
     if not tasks_list: return await client.send_message(user_id, "❌ No valid payload mapped.")
 
+    new_folder = bool(is_batch and not data.get("skip_folder"))
+    dest_path = data.get("dest_names", {}).get(str(folder_id), "/")
+
     # 🐙 GitHub mode ON ho to download + upload runner par (batch folder bhi runner banata hai)
-    if await gh_try_dispatch(client, user_id, job_id, tasks_list, folder_id, is_batch, batch_name, cookies, key):
+    if await gh_try_dispatch(client, user_id, job_id, tasks_list, folder_id, is_batch, batch_name, cookies, key, dest_path, new_folder):
         return
 
     # Normal hosting flow
-    target_folder_id = await loop.run_in_executor(None, create_cloud_folder, batch_name, folder_id, cookies, key) if is_batch else folder_id
-    await run_pipeline(client, user_id, job_id, tasks_list, target_folder_id, is_batch, batch_name, cookies, key)
+    target_folder_id = await loop.run_in_executor(None, create_cloud_folder, batch_name, folder_id, cookies, key) if new_folder else folder_id
+    await run_pipeline(client, user_id, job_id, tasks_list, target_folder_id, is_batch, batch_name, cookies, key,
+                       dest_path=dest_path, new_folder=new_folder)
 
 
-async def run_pipeline(client, user_id, job_id, tasks_list, target_folder_id, is_batch, batch_name, cookies, key, status_msg=None):
+async def run_pipeline(client, user_id, job_id, tasks_list, target_folder_id, is_batch, batch_name, cookies, key, status_msg=None, dest_path="/", new_folder=None):
     """Download -> (split) -> Jazz upload -> share links. Hosting aur GitHub runner dono yahi chalate hain."""
     loop = asyncio.get_event_loop()
+    if new_folder is None: new_folder = is_batch
     status_msg = status_msg or await client.send_message(user_id, "🔄 *Starting Tasks...*")
     tracker = MultiProgressTracker(status_msg, len(tasks_list), is_batch)
     
@@ -3719,9 +3767,9 @@ async def run_pipeline(client, user_id, job_id, tasks_list, target_folder_id, is
 
     await asyncio.gather(*(asyncio.create_task(process_item(idx, item)) for idx, item in enumerate(tasks_list)))
     
-    folder_share_link, folder_share_link_id = (await loop.run_in_executor(None, generate_share_link, target_folder_id, True, cookies, key)) if is_batch else (None, None)
+    folder_share_link, folder_share_link_id = (await loop.run_in_executor(None, generate_share_link, target_folder_id, True, cookies, key)) if new_folder else (None, None)
 
-    for chunk in build_final_messages(tracker.tasks, is_batch, batch_name, folder_share_link, folder_share_link_id):
+    for chunk in build_final_messages(tracker.tasks, is_batch, batch_name, folder_share_link, folder_share_link_id, dest_path, new_folder):
         await client.send_message(user_id, chunk, disable_web_page_preview=True)
         await asyncio.sleep(1)
     try: await status_msg.delete()
