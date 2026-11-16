@@ -1508,62 +1508,245 @@ async def download_direct_link(url, filepath, task_id, tracker):
     return filepath
 
 # --- ADVANCED DIRECT LINK EXTRACTOR (/ex) ---
+# File link:   https://cloud.jazzdrive.com.pk/share/<key>
+# Folder link: https://cloud.jazzdrive.com.pk/share/f/<key>   (pehle "f" ko key samajh raha tha — fixed)
+def _ex_add_filename(direct_link, filename):
+    if direct_link and filename and "filename=" not in direct_link:
+        sep = "&" if "?" in direct_link else "?"
+        return f"{direct_link}{sep}filename={urllib.parse.quote(filename)}"
+    return direct_link
+
+def _ex_fetch_file(file_key):
+    """Single shared file -> (filename, direct_link)."""
+    try:
+        share_url = f"https://cloud.jazzdrive.com.pk/share/{file_key}"
+        session = requests.Session()
+        headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json, text/plain, */*', 'Referer': share_url}
+        session.get(share_url, headers=headers, timeout=10)
+        api_url = f"https://cloud.jazzdrive.com.pk/sapi/media/set?action=get&items=true&thumbnaildimensions=true&shared=true&key={file_key}"
+        res = session.post(api_url, headers=headers, json={"data": {}}, timeout=10)
+        data = res.json()
+        sets = data.get('data', {}).get('sets', [])
+        if sets:
+            items = sets[0].get('items', [])
+            if items:
+                item = items[0]
+                filename = item.get('name')
+                return filename, _ex_add_filename(item.get('url'), filename)
+    except Exception:
+        pass
+    return None, None
+
+def _ex_deep_ids(obj, out, path=""):
+    """Login response me se folder-id jaisi numeric values dhoondo (key name me 'folder' ya 'id')."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if isinstance(v, (int, str)) and str(v).isdigit() and ("folder" in kl or kl in ("id", "parentid", "rootid", "root")):
+                if str(v) not in out:
+                    out.append(str(v))
+            _ex_deep_ids(v, out, f"{path}.{k}")
+    elif isinstance(obj, list):
+        for v in obj:
+            _ex_deep_ids(v, out, path)
+
+EX_MEDIA_FIELDS = ["name", "modificationdate", "size", "thumbnails", "videometadata", "audiometadata",
+                   "favorite", "shared", "url", "playbackurl", "transcodingstatus"]
+
+def _ex_fetch_folder(folder_key):
+    """Shared folder (share/f/KEY) -> ([(folder_path, name, size, direct_link, raw_item), ...], debug_text).
+    Flow (browser DevTools se confirmed):
+      1) POST sapi/link/login?action=login  body {"data":{"accesstoken": KEY}}  -> jsessionid + validationkey
+      2) GET  sapi/media/folder?action=list&parentid=ID&limit=200&shared=true&validationkey=VK
+      3) POST sapi/media?action=get&folderid=ID&limit=200&shared=true&validationkey=VK  body {"data":{"fields":[...]}}
+    """
+    base = "https://cloud.jazzdrive.com.pk/sapi"
+    share_url = f"https://cloud.jazzdrive.com.pk/share/f/{folder_key}"
+    session = requests.Session()
+    headers = browser_like_headers()
+    headers['Referer'] = share_url
+    headers['Accept'] = 'application/json, text/plain, */*'
+    debug = []
+
+    try:
+        session.get(share_url, headers={'User-Agent': headers['User-Agent']}, timeout=15)
+        r = session.post(f"{base}/link/login?action=login", headers=headers,
+                         json={"data": {"accesstoken": folder_key}}, timeout=20)
+        ld = r.json().get('data', {}) or {}
+    except Exception as e:
+        return [], f"anonymous login fail: {e}"
+    vk = ld.get('validationkey')
+    if not vk:
+        return [], f"login me validationkey nahi mili (HTTP {r.status_code}); keys: {list(ld.keys())}"
+
+    # root folder id: login response me se (key names alag ho sakte hain, isliye sab numeric candidates)
+    cand = []
+    _ex_deep_ids(ld, cand)
+    debug.append(f"login keys: {list(ld.keys())}; id candidates: {cand}")
+
+    results, seen_urls = [], set()
+
+    def list_media(folder_id, path):
+        try:
+            mr = session.post(f"{base}/media?action=get&folderid={folder_id}&limit=200&shared=true&validationkey={vk}",
+                              headers=headers, json={"data": {"fields": EX_MEDIA_FIELDS}}, timeout=25)
+            md = mr.json().get('data', {}) or {}
+        except Exception as e:
+            debug.append(f"media {folder_id}: {e}")
+            return 0
+        items = md.get('media') or []
+        for it in items:
+            url = it.get('url')
+            name = it.get('name') or "file"
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                results.append((path, name, it.get('size'), _ex_add_filename(url, name), it))
+        return len(items)
+
+    def walk(folder_id, path, depth):
+        n = list_media(folder_id, path)
+        if depth >= 4:
+            return n
+        try:
+            fr = session.get(f"{base}/media/folder?action=list&parentid={folder_id}&limit=200&shared=true&validationkey={vk}",
+                             headers=headers, timeout=20)
+            subs = (fr.json().get('data', {}) or {}).get('folders') or []
+        except Exception:
+            subs = []
+        for sf in subs:
+            sid = sf.get('id')
+            if sid is not None and str(sid) != str(folder_id):
+                n += walk(sid, f"{path}/{sf.get('name', sid)}", depth + 1)
+        return n
+
+    # Root id ka asli source: bot ka purana share-check (verify_share_link_live) isi se folder info leta tha:
+    # media/folder?action=get&shared=true&key=KEY  ->  data.folders[0].id
+    # (pehle bina login session ke call hota tha to khali body aati thi; ab JSESSIONID + validationkey ke saath)
+    roots = []
+    for gurl in (f"{base}/media/folder?action=get&shared=true&key={folder_key}&validationkey={vk}",
+                 f"{base}/media/folder?action=get&shared=true&validationkey={vk}"):
+        try:
+            gr = session.get(gurl, headers=headers, timeout=20)
+            gf = (gr.json().get('data', {}) or {}).get('folders') or []
+            debug.append(f"folder get: HTTP {gr.status_code}, folders={len(gf)}")
+            if gf:
+                ids = {str(f.get('id')) for f in gf}
+                # top folder = jiska parent list me nahi hai, warna pehla
+                tops = [f for f in gf if str(f.get('parentid')) not in ids] or gf
+                for f in tops:
+                    if f.get('id') is not None and str(f['id']) not in roots:
+                        roots.append(str(f['id']))
+                break
+        except Exception as e:
+            debug.append(f"folder get error: {e}")
+    for c in cand:
+        if c not in roots:
+            roots.append(c)
+    debug.append(f"root candidates: {roots}")
+
+    for fid in roots:
+        if walk(fid, "", 0):
+            break
+    if not results:
+        debug.append("kisi bhi candidate folder id se files nahi mili")
+    return results, "\n".join(debug)
+
+def _ex_file_type(name):
+    ext = os.path.splitext(name or "")[1].lower().lstrip(".")
+    video = {"mkv", "mp4", "avi", "mov", "webm", "ts", "m4v", "flv", "wmv"}
+    audio = {"mp3", "m4a", "flac", "wav", "aac", "ogg", "opus"}
+    image = {"jpg", "jpeg", "png", "gif", "webp", "bmp"}
+    sub   = {"srt", "ass", "ssa", "vtt", "sub"}
+    arch  = {"zip", "rar", "7z", "cbz", "cbr", "tar", "gz"}
+    kind = ("Video" if ext in video else "Audio" if ext in audio else "Image" if ext in image
+            else "Subtitle" if ext in sub else "Archive" if ext in arch else "PDF" if ext == "pdf" else "File")
+    return f"{kind} (.{ext})" if ext else kind
+
+def _ex_fmt_date(v):
+    try:
+        n = float(v)
+        if n > 1e11: n /= 1000.0          # milliseconds
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(n, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return str(v) if v else ""
+
+def _ex_txt_block(i, path, name, size, link, raw):
+    lines = [f"{i}. {(path + '/' if path else '')}{name}"]
+    if str(size).isdigit():
+        lines.append(f"   Size: {format_bytes(int(size))}")
+    lines.append(f"   Type: {_ex_file_type(name)}")
+    d = _ex_fmt_date((raw or {}).get('modificationdate'))
+    if d:
+        lines.append(f"   Date: {d}")
+    lines.append(f"   Link: {link}")
+    return "\n".join(lines)
+
+def _ex_natural_key(text):
+    """EP-2 < EP-10 : numbers ko number ki tarah sort karo."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', text or "")]
+
 @app.on_message(filters.command("ex"))
 async def extract_link_cmd(client, message):
     if message.from_user.id not in allowed_users: return
-    
-    keys = re.findall(r'share/([a-zA-Z0-9_-]+)', message.text)
-    
-    if not keys:
-        return await message.reply("❌ No valid Jazz Drive links found. Format: `/ex https://cloud.jazzdrive...`")
-        
-    msg = await message.reply(f"⏳ Extracting {len(keys)} direct link(s)...")
 
-    def fetch_api_data(file_key):
-        try:
-            share_url = f"https://cloud.jazzdrive.com.pk/share/{file_key}"
-            session = requests.Session()
-            headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json, text/plain, */*', 'Referer': share_url}
-            session.get(share_url, headers=headers, timeout=10)
-            api_url = f"https://cloud.jazzdrive.com.pk/sapi/media/set?action=get&items=true&thumbnaildimensions=true&shared=true&key={file_key}"
-            res = session.post(api_url, headers=headers, json={"data": {}}, timeout=10)
-            data = res.json()
-            
-            direct_link, filename = None, None
-            sets = data.get('data', {}).get('sets', [])
-            if sets and len(sets) > 0:
-                items = sets[0].get('items', [])
-                if items and len(items) > 0:
-                    item = items[0]
-                    filename = item.get('name')
-                    direct_link = item.get('url')
-                    if direct_link and filename and "filename=" not in direct_link:
-                        safe_filename = urllib.parse.quote(filename)
-                        direct_link = f"{direct_link}&filename={safe_filename}"
-            return filename, direct_link
-        except Exception:
-            return None, None
+    # (?:f/)? -> folder links ke liye. Pehle "share/f/KEY" me key = "f" pakad leta tha.
+    links = re.findall(r'share/(f/)?([a-zA-Z0-9_-]+)', message.text)
+
+    if not links:
+        return await message.reply("❌ No valid Jazz Drive links found. Format: `/ex https://cloud.jazzdrive...`")
+
+    msg = await message.reply(f"⏳ Extracting {len(links)} direct link(s)...")
 
     try:
         loop = asyncio.get_event_loop()
         results = []
-        
-        for key in keys:
-            filename, direct_link = await loop.run_in_executor(None, fetch_api_data, key)
-            if filename and direct_link:
-                results.append(f"📄 **{filename}**\n🔗 `{direct_link}`\n")
+        folder_exports = []
+
+        for is_folder, key in links:
+            if is_folder:
+                files, dbg = await loop.run_in_executor(None, _ex_fetch_folder, key)
+                if files:
+                    # hamesha order me: pehle episode 1, 2, 3 ... (natural sort, path ke hisab se)
+                    files.sort(key=lambda f: (_ex_natural_key(f[0]), _ex_natural_key(f[1])))
+                    lines = [f"📁 **Folder** — {len(files)} file(s) (links txt me, order ke sath)\n"]
+                    for i, (path, name, size, link, raw) in enumerate(files, 1):
+                        sz = f" ({format_bytes(int(size))})" if str(size).isdigit() else ""
+                        lines.append(f"{i}. {(path + '/' if path else '')}{name}{sz}")
+                    results.append("\n".join(lines) + "\n")
+                    folder_exports.append((key, "\n\n".join(_ex_txt_block(i, *f) for i, f in enumerate(files, 1))))
+                else:
+                    results.append(f"❌ Folder extraction failed for key: `{key}`\n"
+                                   f"ℹ️ Debug:\n`{dbg}`\n")
             else:
-                results.append(f"❌ Extraction failed for key: `{key}`\n")
-        
+                filename, direct_link = await loop.run_in_executor(None, _ex_fetch_file, key)
+                if filename and direct_link:
+                    results.append(f"📄 **{filename}**\n🔗 `{direct_link}`\n")
+                else:
+                    results.append(f"❌ Extraction failed for key: `{key}`\n")
+
         final_text = "✅ **Extraction Complete!**\n\n" + "\n".join(results)
-        
+
         chunks = [final_text[i:i+4000] for i in range(0, len(final_text), 4000)]
         for i, chunk in enumerate(chunks):
             if i == 0:
                 await msg.edit(chunk, disable_web_page_preview=True)
             else:
                 await message.reply(chunk, disable_web_page_preview=True)
-                
+
+        for n, (fkey, ftext) in enumerate(folder_exports, 1):
+            txt_path = f"/tmp/ex_links_{message.id}_{n}.txt"
+            try:
+                total = ftext.count("\n   Link: ") + (1 if ftext.startswith("1.") and "\n   Link: " not in ftext else 0)
+                with open(txt_path, "w", encoding="utf-8") as fh:
+                    fh.write(ftext)
+                await message.reply_document(txt_path, caption=f"🔗 {total} file(s) — name, size, type, link (1 se last tak, order me)")
+            except Exception as e:
+                await message.reply(f"⚠️ txt bhejne me error: {e}")
+            finally:
+                try: os.remove(txt_path)
+                except Exception: pass
+
     except Exception as e:
         await msg.edit(f"⚠️ Error during extraction: {str(e)}")
 
@@ -2168,10 +2351,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: jazz_runner
 
-      - name: Free disk space
+      - name: Free disk space (background)
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
+          nohup sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/local/share/boost /opt/hostedtoolcache/CodeQL >/dev/null 2>&1 &
           df -h / | tail -1
 
       - name: Setup Python
@@ -2180,7 +2366,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -q pyrogram tgcrypto requests requests-toolbelt nest-asyncio aiohttp aiofiles cryptography
+        run: pip install -q --disable-pip-version-check --prefer-binary pyrogram tgcrypto requests requests-toolbelt nest-asyncio aiohttp aiofiles cryptography
 
       - name: Download + upload to Jazz Drive
         working-directory: jazz_runner
@@ -2653,8 +2839,8 @@ async def gh_monitor(client, job_id):
     token, repo, title = job["token"], job["repo"], f"Jazz job {job_id}"
     run = None
     try:
-        for _ in range(72):                      # ~6 min tak run ka intezar
-            await asyncio.sleep(5)
+        for _ in range(180):                     # ~6 min tak run ka intezar
+            await asyncio.sleep(2)
             s, r = await loop.run_in_executor(None, gh_request, "GET",
                 f"{GH_API}/repos/{repo}/actions/workflows/{GH_WORKFLOW_FILE}/runs?event=workflow_dispatch&per_page=20", token)
             if s == 200:
