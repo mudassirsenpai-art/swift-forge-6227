@@ -17,6 +17,7 @@ import glob
 
 from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait
 import requests
 from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 from requests.adapters import HTTPAdapter
@@ -766,9 +767,9 @@ class SplitDeclined(Exception):
     """Split OFF tha aur user ne Stop dabaya (ya jawab nahi diya)."""
 
 class PartUploadFailed(Exception):
-    def __init__(self, index, total):
+    def __init__(self, index, total, reason=None):
         super().__init__(f"part {index}/{total} upload failed")
-        self.index, self.total = index, total
+        self.index, self.total, self.reason = index, total, reason
 
 # ---- USER-FACING ERROR / STOP MESSAGES (ek jaisi English wording: "<Category> — <detail>") ----
 def msg_stopped():
@@ -778,8 +779,9 @@ def msg_split_failed(reason):
     reason = str(reason).strip().rstrip(".")
     return f"Split failed — {reason}"
 
-def msg_part_failed(index, total):
-    return f"Part {index} of {total} failed to upload"
+def msg_part_failed(index, total, reason=None):
+    base = f"Part {index} of {total} failed to upload"
+    return f"{base} — {reason}" if reason else base
 
 def msg_storage_too_big(need, limit):
     return f"Storage limit exceeded — needs {format_bytes(need)}, limit is {format_bytes(limit)}"
@@ -798,33 +800,81 @@ def status_icon(text):
     if t.startswith(("Split failed", "Upload failed", "Part ")): return "❌"
     return "⚠️"
 
+UPLOAD_ERRORS = {}   # local_path -> last failure reason (user ko dikhane ke liye)
+
+def _extract_upload_id(d):
+    if not isinstance(d, dict):
+        return None
+    data = d.get('data')
+    if isinstance(data, dict):
+        for k in ('id', 'fileid', 'mediaid'):
+            if data.get(k) is not None: return data[k]
+        for k in ('media', 'files', 'items'):
+            v = data.get(k)
+            if isinstance(v, list) and v and isinstance(v[0], dict) and v[0].get('id') is not None:
+                return v[0]['id']
+    if isinstance(data, list) and data and isinstance(data[0], dict) and data[0].get('id') is not None:
+        return data[0]['id']
+    return d.get('id')
+
 def upload_file_sync(local_path, name, size, folder_id, cookies, key, on_progress=None, is_cancelled=None):
     """Ek file Jazz Drive par upload (blocking — executor me chalao).
-    Return (ok, file_id). Normal file aur split parts dono yahi use karte hain."""
+    Return (ok, file_id). Fail par wajah UPLOAD_ERRORS[local_path] me hoti hai.
+    Network / 5xx errors par 3 baar tak dobara try karta hai (file har baar shuru se)."""
     mime = mimetypes.guess_type(name)[0] or 'application/octet-stream'
-    metadata = {"name": name, "size": str(size), "folderid": str(folder_id), "contenttype": mime,
-                "modificationdate": datetime.now().strftime("%Y%m%dT%H%M%SZ")}
-    session = requests.Session()
-    session.mount("https://", HTTPAdapter(max_retries=Retry(total=5, backoff_factor=0.5)))
-    headers = {'User-Agent': 'Mozilla/5.0', 'Connection': 'keep-alive'}
+    url = f"https://cloud.jazzdrive.com.pk/sapi/upload?action=save&acceptasynchronous=true&validationkey={key}"
+    UPLOAD_ERRORS.pop(local_path, None)
+    last_err = "unknown error"
 
-    def _cb(monitor_obj):
-        if is_cancelled and is_cancelled():
-            raise Exception("Force Stopped")
-        if on_progress:
-            on_progress(monitor_obj.bytes_read, size)
+    for attempt in range(1, 4):
+        metadata = {"name": name, "size": str(size), "folderid": str(folder_id), "contenttype": mime,
+                    "modificationdate": datetime.now().strftime("%Y%m%dT%H%M%SZ")}
+        headers = {'User-Agent': 'Mozilla/5.0', 'Connection': 'keep-alive'}
 
-    with open(local_path, 'rb') as f:
-        m = MultipartEncoder(fields={'data': (None, json.dumps({"data": metadata}), 'application/json'),
-                                     'file': (name, f, mime)})
-        monitor = MultipartEncoderMonitor(m, _cb)
-        headers['Content-Type'] = monitor.content_type
-        res = session.post(f"https://cloud.jazzdrive.com.pk/sapi/upload?action=save&acceptasynchronous=true&validationkey={key}",
-                           data=monitor, headers=headers, cookies=cookies, timeout=600)
-        if res.status_code == 200:
-            d = res.json()
-            return True, d.get('data', {}).get('id') or d.get('id') or (d['data'][0].get('id') if 'data' in d and isinstance(d['data'], list) and len(d['data']) > 0 else None)
-        return False, None
+        def _cb(monitor_obj):
+            if is_cancelled and is_cancelled():
+                raise Exception("Force Stopped")
+            if on_progress:
+                on_progress(monitor_obj.bytes_read, size)
+
+        try:
+            with requests.Session() as session, open(local_path, 'rb') as f:
+                m = MultipartEncoder(fields={'data': (None, json.dumps({"data": metadata}), 'application/json'),
+                                             'file': (name, f, mime)})
+                monitor = MultipartEncoderMonitor(m, _cb)
+                headers['Content-Type'] = monitor.content_type
+                res = session.post(url, data=monitor, headers=headers, cookies=cookies, timeout=600)
+            body = (res.text or "").strip()
+            snippet = re.sub(r"validationkey=[^&\s\"]+", "validationkey=<hidden>", body[:200]).replace("\n", " ")
+            if 200 <= res.status_code < 300:
+                try:
+                    d = res.json()
+                except Exception:
+                    d = {}
+                if isinstance(d, dict) and d.get('error'):
+                    last_err = f"server error: {str(d.get('error'))[:120]}"
+                else:
+                    fid = _extract_upload_id(d)
+                    if fid is not None:
+                        return True, fid
+                    last_err = f"HTTP {res.status_code} but no file id in reply: {snippet or '<empty>'}"
+                print(f"[UPLOAD] {name[:40]} attempt {attempt}: {last_err}", flush=True)
+                break    # server ne jawab de diya — dobara bhejne se duplicate ban sakta hai
+            last_err = f"HTTP {res.status_code}: {snippet or '<empty>'}"
+            print(f"[UPLOAD] {name[:40]} attempt {attempt}: {last_err}", flush=True)
+            if res.status_code < 500:
+                break    # 4xx (session expired / bad request) retry se theek nahi hota
+        except Exception as e:
+            if is_cancelled and is_cancelled():
+                raise
+            if "Force Stopped" in str(e):
+                raise
+            last_err = f"{type(e).__name__}: {str(e)[:150]}"
+            print(f"[UPLOAD] {name[:40]} attempt {attempt}: {last_err}", flush=True)
+        if attempt < 3:
+            time.sleep(3 * attempt)
+    UPLOAD_ERRORS[local_path] = last_err
+    return False, None
 
 async def ask_split_choice(client, user_id, task_id, name, size, is_cancelled):
     """Split OFF + file 2GB+: download ke baad, upload se pehle user se poochho.
@@ -1060,46 +1110,323 @@ def format_time(seconds):
     h, m = divmod(m, 60)
     return f"{h}:{m:02d}:{s:02d}h" if h > 0 else (f"{m}:{s:02d}m" if m > 0 else f"{s}s")
 
-def get_cloud_folder_contents(folder_id, cookies, key):
-    session = requests.Session()
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    
-    url_folders = f"https://cloud.jazzdrive.com.pk/sapi/media/folder?action=get&validationkey={key}"
-    try:
-        res_f = session.get(url_folders, cookies=cookies, headers=headers, timeout=20)
-        all_folders = res_f.json().get('data', {}).get('folders', [])
-    except Exception:
-        all_folders = []
-        
-    if str(folder_id).lower() == "root":
-        root_folder = next((f for f in all_folders if f.get('name') == '/'), None)
-        if root_folder:
-            folder_id = root_folder.get('id')
-        else:
-            return [], [], None
+# ─────────────────────────────────────────────────────────────────
+# FOLDER TREE HELPERS — /checkall, /E, /find aur upload-destination teeno yahi use karte hain
+# ─────────────────────────────────────────────────────────────────
+import concurrent.futures
 
-    subfolders = [f for f in all_folders if str(f.get('parentid')) == str(folder_id) and f.get('name') != '/']
-    
-    url_files = f"https://cloud.jazzdrive.com.pk/sapi/media/file?action=get&validationkey={key}"
-    files = []
-    
+PAGE_LIMIT = 4000                 # Telegram message limit (safe side)
+_PAGE_RULE = "━━━━━━━━━━━━━━━━━━━━"
+DRIVE_PAGE_SIZE = 200             # same offset/limit contract as the Jazz Drive web client
+FIND_SCAN_WORKERS = 8             # /find folders ko parallel scan karta hai
+
+def md_safe(text):
+    """Naam ko `code` span me daalne se pehle backtick hata do (markdown na toote)."""
+    return str(text if text is not None else "").replace("`", "'")
+
+def _nat_key(text):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(text or ""))]
+
+def _norm_text(s):
+    """Search ke liye: lowercase + sab symbols (. _ - ...) space."""
+    return re.sub(r"[\W_]+", " ", str(s or "").lower()).strip()
+
+def _to_int(v, default=0):
     try:
-        res_file = session.post(url_files, json={"data": {"folderid": int(folder_id)}}, cookies=cookies, headers=headers, timeout=20)
-        file_data = res_file.json().get('data', {})
-        files = file_data.get('files', [])
-        if not files and 'items' in file_data:
-            files = file_data.get('items', [])
+        return int(float(v))
+    except Exception:
+        return default
+
+def _truthy(v):
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "y")
+    return bool(v)
+
+def fetch_all_folders(cookies, key):
+    """Drive ke SAARE folders (flat list) + root id (str). Fail par ([], None)."""
+    url = f"https://cloud.jazzdrive.com.pk/sapi/media/folder?action=get&validationkey={key}"
+    try:
+        res = requests.get(url, cookies=cookies, headers={'User-Agent': 'Mozilla/5.0'}, timeout=25)
+        folders = _drive_data(res).get('folders')
+        if not isinstance(folders, list):
+            raise ValueError('Missing folders list')
+    except Exception:
+        print("fetch_all_folders: request failed")
+        return [], None
+    root = next((f for f in folders if f.get('name') == '/'), None)
+    root_id = str(root.get('id')) if root and root.get('id') is not None else None
+    return folders, root_id
+
+def build_folder_index(all_folders, root_id):
+    """Folder tree -> DFS order list: [{n, id, name, path, depth, parent}].
+    n = stable DFS order number used by folder selection and upload menus."""
+    if root_id is None:
+        return []
+    kids = {}
+    for f in all_folders:
+        if f.get('name') == '/':
+            continue
+        kids.setdefault(str(f.get('parentid')), []).append(f)
+    index, seen = [], set()
+
+    def walk(pid, parent_path, depth):
+        for f in sorted(kids.get(str(pid), []), key=lambda x: _nat_key(x.get('name', ''))):
+            fid = str(f.get('id'))
+            if fid in seen:
+                continue
+            seen.add(fid)
+            name = str(f.get('name', ''))
+            path = f"{parent_path}/{name}"
+            index.append({"n": len(index) + 1, "id": fid, "name": name, "path": path,
+                          "depth": depth, "parent": str(pid)})
+            walk(fid, path, depth + 1)
+
+    walk(root_id, "", 0)
+    return index
+
+def _drive_data(response):
+    """Never interpret HTTP/API errors or malformed responses as an empty drive."""
+    response.raise_for_status()
+    body = response.json()
+    if not isinstance(body, dict) or body.get("error") or not isinstance(body.get("data"), dict):
+        raise ValueError("Drive returned an invalid/error response")
+    if body["data"].get("error"):
+        raise ValueError("Drive returned an API error")
+    return body["data"]
+
+
+def _item_metadata(item):
+    metadata = item.get("metadata")
+    return {**metadata, **item} if isinstance(metadata, dict) else dict(item)
+
+
+def fetch_folder_files(folder_id, cookies, key):
+    """Read ALL media in one folder using the web client's folder-scoped endpoint.
+
+    /media/file?action=get ignores the old JSON folderid filter on this service,
+    so it must never be used as a fallback: that fabricates paths and duplicates.
+    None means incomplete/failed, [] means a successfully read empty folder.
+    """
+    files, seen, offset = [], set(), 0
+    try:
+        with requests.Session() as session:
+            while True:
+                response = session.post(
+                    "https://cloud.jazzdrive.com.pk/sapi/media",
+                    params={"action": "get", "folderid": str(folder_id),
+                            "offset": offset, "limit": DRIVE_PAGE_SIZE, "validationkey": key},
+                    json={"data": {"fields": ["name", "size", "folderid", "shared"]}},
+                    cookies=cookies, headers=browser_like_headers(), timeout=25)
+                data = _drive_data(response)
+                batch = data.get("media")
+                if not isinstance(batch, list):
+                    raise ValueError("Missing media list")
+                new = 0
+                for raw in batch:
+                    if not isinstance(raw, dict) or raw.get("id") is None:
+                        raise ValueError("Missing media identity")
+                    item = _item_metadata(raw)
+                    fid = str(item["id"])
+                    # Refuse an unscoped/global response instead of inventing paths.
+                    parent = item.get("folderid")
+                    if parent is not None and str(parent) != str(folder_id):
+                        raise ValueError("Folder filter was not respected")
+                    if fid not in seen:
+                        seen.add(fid)
+                        files.append(item)
+                        new += 1
+                if batch and not new:
+                    raise ValueError("Drive repeated a page; listing is incomplete")
+                if len(batch) < DRIVE_PAGE_SIZE:
+                    return files
+                offset += len(batch)
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        # Do not log exceptions containing validation keys or response bodies.
+        return None
+
+
+def get_cloud_folder_contents(folder_id, cookies, key):
+    """(Purana API, compatibility ke liye) -> (subfolders, files, folder_id)."""
+    all_folders, root_id = fetch_all_folders(cookies, key)
+    if str(folder_id).lower() == "root":
+        if not root_id:
+            return [], [], None
+        folder_id = root_id
+    subfolders = [f for f in all_folders if str(f.get('parentid')) == str(folder_id) and f.get('name') != '/']
+    files = fetch_folder_files(folder_id, cookies, key) or []
+    return subfolders, files, folder_id
+
+# ---- PAGING: 4000 char limit — har entry poori rehti hai, naam kabhi beech se nahi katta ----
+def _telegram_len(text):
+    """Telegram counts UTF-16 code units, not Python Unicode code points."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+MAX_ENTITIES = 70   # Telegram ~100 entities/msg se zyada hon to formatting hat jati hai aur "/path" blue link ban jata hai
+
+def _entity_count(text):
+    return text.count("**") // 2 + text.count("`") // 2 + text.count("__") // 2
+
+def pack_entries(entries, limit, sep="\n", max_entities=MAX_ENTITIES):
+    pages, cur = [], ""
+    for entry in entries:
+        entry = str(entry)
+        while _telegram_len(entry) > limit:
+            # Find a safe code-point boundary, preferring a whole line.
+            cut, used = 0, 0
+            for char in entry:
+                size = _telegram_len(char)
+                if used + size > limit:
+                    break
+                used += size
+                cut += 1
+            line = entry.rfind("\n", 0, cut + 1)
+            cut = line if line > 0 else cut
+            if cur:
+                pages.append(cur)
+                cur = ""
+            pages.append(entry[:cut])
+            entry = entry[cut:].lstrip("\n")
+        if not entry:
+            continue
+        joined = f"{cur}{sep}{entry}" if cur else entry
+        if cur and (_telegram_len(joined) > limit or _entity_count(joined) > max_entities):
+            pages.append(cur)
+            cur = entry
+        else:
+            cur = joined
+    if cur:
+        pages.append(cur)
+    return pages
+
+
+def make_pages(title, entries, footer="", sep="\n", limit=PAGE_LIMIT):
+    """Keep every page below Telegram's UTF-16 limit, including its header."""
+    budget = limit - _telegram_len(title) - _telegram_len(_PAGE_RULE) - 80
+    bodies = pack_entries(entries, max(100, budget), sep) or [""]
+    n = len(bodies)
+    pages = []
+    for i, body in enumerate(bodies, 1):
+        tag = f" · page {i}/{n}" if n > 1 else ""
+        pages.append(f"{title}{tag}\n{_PAGE_RULE}\n{body.strip()}".rstrip())
+    if footer:
+        if _telegram_len(pages[-1]) + _telegram_len(footer) + 2 <= limit:
+            pages[-1] += "\n\n" + footer
+        else:
+            pages.extend(pack_entries([footer], limit))
+    return pages
+
+
+async def _send_pages(client, chat_id, first_msg, pages, last_markup=None):
+    """Deliver every page in order; retry FloodWait, never silently drop a page."""
+    ids, last = [], len(pages) - 1
+    for i, text in enumerate(pages):
+        markup = last_markup if i == last else None
+        for attempt in range(4):
+            try:
+                if i == 0 and first_msg is not None:
+                    await first_msg.edit(text, reply_markup=markup, disable_web_page_preview=True)
+                    ids.append(first_msg.id)
+                else:
+                    sent = await client.send_message(chat_id, text, reply_markup=markup, disable_web_page_preview=True)
+                    ids.append(sent.id)
+                break
+            except FloodWait as exc:
+                if attempt == 3:
+                    raise
+                await asyncio.sleep(max(1, exc.value))
+            # Other errors propagate: never claim success after silently losing results.
+    return ids
+
+async def _delete_msgs(client, chat_id, ids):
+    ids = [i for i in (ids or []) if i]
+    if not ids:
+        return
+    try:
+        await client.delete_messages(chat_id, ids)
     except Exception:
         pass
-        
-    if not files:
-        try:
-            res_file = session.post(url_files, json={"data": {"folderids": [int(folder_id)]}}, cookies=cookies, headers=headers, timeout=20)
-            files = res_file.json().get('data', {}).get('files', [])
-        except Exception:
-            pass
 
-    return subfolders, files, folder_id
+# ---- FOLDER RESOLVER: name / order number / path / ID ----
+def resolve_folder_query(text, index, root_id, prefer_id=False):
+    """User ka likha hua -> (status, matches)
+       status: 'ok' (ek pakka folder) | 'multi' (kayi barabar) | 'fuzzy' (shayad yeh) | 'none'
+       Samajhta hai: order number (3) · path (/anime/abc ya anime/abc) · folder name · folder ID · '/' = root"""
+    raw = str(text or "").strip().strip("`'\"").strip()
+    if not raw:
+        return "none", []
+    root = {"n": 0, "id": str(root_id), "name": "/", "path": "/", "depth": 0, "parent": ""}
+    if raw == "/" or raw.lower() == "root":
+        return "ok", [root]
+
+    if raw.isdigit():
+        by_id = [root] if raw == str(root_id) else [e for e in index if e["id"] == raw]
+        by_num = [index[int(raw) - 1]] if 1 <= int(raw) <= len(index) else []
+        first, second = (by_id, by_num) if prefer_id else (by_num, by_id)
+        if first:
+            return "ok", first
+        if second:
+            return "ok", second
+        # number/ID se match nahi hua -> shayad folder ka naam hi number hai (jaise 2024): neeche naam se dhoondo
+
+    p = re.sub(r"/{2,}", "/", raw.replace("\\", "/")).strip()
+    key = p.strip("/").lower()
+    if not key:
+        return "none", []
+
+    key_cs = p.strip("/")          # case-sensitive version (downloads != Downloads)
+
+    def pick(found, by):
+        if len(found) > 1:
+            exact = [e for e in found if e[by] == ("/" + key_cs if by == "path" else key_cs)]
+            if len(exact) == 1:
+                return "ok", exact
+        return ("ok" if len(found) == 1 else "multi"), found
+
+    exact_path = [e for e in index if e["path"].lower() == "/" + key]
+    if exact_path:
+        return pick(exact_path, "path")
+    if "/" not in key:
+        exact_name = [e for e in index if e["name"].lower() == key]
+        if exact_name:
+            return pick(exact_name, "name")
+    suffix = [e for e in index if e["path"].lower().endswith("/" + key)]
+    if suffix:
+        return ("ok" if len(suffix) == 1 else "multi"), suffix
+    nk = _norm_text(key)
+    fuzzy = [e for e in index if nk and nk in _norm_text(e["path"])]
+    if fuzzy:
+        return "fuzzy", fuzzy
+    return "none", []
+
+def candidate_pages(matches, status, hint):
+    """Kayi folders match hon to unki list (order number ke sath) — user number bhej kar chune."""
+    shown = matches[:25]
+    entries = [f"**{m['n']}.** 📁 `{md_safe(m['path'])}`" for m in shown]
+    if len(matches) > len(shown):
+        entries.append(f"… and {len(matches) - len(shown)} more — be more specific")
+    title = "🔎 **Did you mean one of these?**" if status == "fuzzy" else "🔎 **More than one match**"
+    return make_pages(title, entries, hint)
+
+def render_folder_tree_pages(index, root_id):
+    """/checkall: root ke folders + unke sub-folders ka path. Sirf ID, koi per-folder command nahi."""
+    count = len(index)
+    title = f"📂 **Drive Folders** — {count} folder{'s' if count != 1 else ''}"
+    entries = [f"🏠 **Root** · 🆔 `{root_id}`"]
+    group = []
+    for e in index:
+        if e["depth"] == 0:
+            if group:
+                entries.append("\n".join(group))
+            group = [f"📁 **{e['n']}.** `{md_safe(e['name'])}` · 🆔 `{e['id']}`"]
+        else:
+            group.append(f"{'   ' * e['depth']}↳ **{e['n']}.** `{md_safe(e['path'])}` · 🆔 `{e['id']}`")
+    if group:
+        entries.append("\n".join(group))
+    if not index:
+        entries.append("📭 No folders yet — everything is in Root.")
+    footer = "💡 `/E <ID>` open a folder · `/find <name>` search"
+    return make_pages(title, entries, footer, sep="\n\n")
 
 # --- UI PROGRESS TRACKER ---
 PART_STATUS_LABEL = {
@@ -1136,6 +1463,8 @@ class MultiProgressTracker:
         self.last_update_time = time.time()
         self.success_count = 0
         self.file_counter = 1
+        self.extra_msgs = []      # status 4000 char se zyada ho to baqi pages alag messages me
+        self._render_lock = None
 
     def init_task(self, task_id, filename):
         self.tasks[task_id] = {
@@ -1240,7 +1569,10 @@ class MultiProgressTracker:
         
         text = f"📦 **Batch Processing [{self.total_files} Files]**\n━━━━━━━━━━━━━━━━━━━━\n\n" if self.is_batch else "📄 **Single File Processing**\n━━━━━━━━━━━━━━━━━━━━\n\n"
         
+        header = text
+        blocks = []
         for tid, t in self.tasks.items():
+            text = ""
             text += f"📄 **{t['index']}. {t['name']}**\n"
             text += f"├ 🗜️ **Size:** {format_bytes(t['size']) if t['size'] > 0 else 'Pending...'}\n"
             text += f"├ ⏱️ **Time:** ⬇️ {format_time(t['dl_time'])} | ⬆️ {format_time(t['ul_time'])} | ⏳ {format_time(t['dl_time'] + t['ul_time'])}\n"
@@ -1306,13 +1638,38 @@ class MultiProgressTracker:
                 text += f"└ 🔄 **Status:** Waiting to {t['action'].split(' ')[0].lower()}...\n\n"
             else:
                 text += f"└ 🔄 **Status:** {t['action']}...\n\n"
+            blocks.append(text)
 
-        try:
-            if len(text) > 4000:
-                text = text[:3900] + "\n... (Truncated due to length)"
-            await self.message.edit_text(text, disable_web_page_preview=True)
-        except Exception:
-            pass
+        # 4000 char / 100 entity limit: header + blocks ko pages me todo, har page alag message
+        pages = pack_entries([header.rstrip("\n")] + [b.rstrip("\n") for b in blocks], 3800, sep="\n\n", max_entities=MAX_ENTITIES)
+        pages = pages or [header]
+        if len(pages) > 1:
+            pages = [f"{pg}\n\n📄 page {i}/{len(pages)}" for i, pg in enumerate(pages, 1)]
+        if self._render_lock is None:
+            self._render_lock = asyncio.Lock()
+        async with self._render_lock:
+            for i, pg in enumerate(pages):
+                try:
+                    if i == 0:
+                        await self.message.edit_text(pg, disable_web_page_preview=True)
+                    elif i - 1 < len(self.extra_msgs):
+                        await self.extra_msgs[i - 1].edit_text(pg, disable_web_page_preview=True)
+                    else:
+                        self.extra_msgs.append(await self.message.reply(pg, quote=False, disable_web_page_preview=True))
+                except FloodWait as fw:
+                    await asyncio.sleep(min(fw.value, 10))
+                except Exception:
+                    pass
+            while len(self.extra_msgs) > len(pages) - 1:
+                m = self.extra_msgs.pop()
+                try: await m.delete()
+                except Exception: pass
+
+    async def cleanup(self):
+        for m in self.extra_msgs:
+            try: await m.delete()
+            except Exception: pass
+        self.extra_msgs = []
 
 PART_LINK_CONCURRENCY = 3     # ek saath max itne parts ki link-generation (server par bojh na pade)
 
@@ -2351,13 +2708,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-          sparse-checkout: jazz_runner
 
-      - name: Free disk space (background)
+      - name: Free disk space
         run: |
-          nohup sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/local/share/boost /opt/hostedtoolcache/CodeQL >/dev/null 2>&1 &
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
           df -h / | tail -1
 
       - name: Setup Python
@@ -2366,7 +2720,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -q --disable-pip-version-check --prefer-binary pyrogram tgcrypto requests requests-toolbelt nest-asyncio aiohttp aiofiles cryptography
+        run: pip install -q pyrogram tgcrypto requests requests-toolbelt nest-asyncio aiohttp aiofiles cryptography
 
       - name: Download + upload to Jazz Drive
         working-directory: jazz_runner
@@ -2839,8 +3193,8 @@ async def gh_monitor(client, job_id):
     token, repo, title = job["token"], job["repo"], f"Jazz job {job_id}"
     run = None
     try:
-        for _ in range(180):                     # ~6 min tak run ka intezar
-            await asyncio.sleep(2)
+        for _ in range(72):                      # ~6 min tak run ka intezar
+            await asyncio.sleep(5)
             s, r = await loop.run_in_executor(None, gh_request, "GET",
                 f"{GH_API}/repos/{repo}/actions/workflows/{GH_WORKFLOW_FILE}/runs?event=workflow_dispatch&per_page=20", token)
             if s == 200:
@@ -2977,55 +3331,81 @@ async def multi_acc_callbacks(client, query):
     elif data == "log_no":
         await render_accounts_menu(user_id, query.message, is_edit=True)
 
-@app.on_message(filters.command("checkall"))
+@app.on_message(filters.command(["checkall", "checkallfolder", "checkallfiles"]))
 async def checkall_cmd(client, message):
     if message.from_user.id not in allowed_users: return
-    await explore_folder(client, message, "root")
+    cookies, key = load_cookies(message.from_user.id)
+    if not key: return await message.reply("❌ Please `/login` first.")
+    command = message.command[0].split("@")[0].lower()
+    kind = {"checkallfolder": "folder", "checkallfiles": "file"}.get(command)
+    msg = await message.reply("🔎 Reading your drive...")
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(
+            None, find_in_drive, "", cookies, key, kind)
+    except Exception:
+        return await msg.edit("❌ Could not read the drive. Please try again.")
+    if data.get("error"):
+        return await msg.edit("❌ Session expired or drive unreachable. Please `/login` again.")
+    title = {"folder": "📂 **All Folders**", "file": "📄 **All Files**"}.get(kind, "📂 **All Folders and Files**")
+    entries = [_find_entry(i, r) for i, r in enumerate(data["results"], 1)]
+    if kind != "file":
+        entries.insert(0, f"🏠 **Root** · `/` · 🆔 `{data['root_id']}`")
+    if not data["results"]:
+        entries.append("📭 No items found.")
+    await _send_pages(client, message.chat.id, msg, make_pages(
+        f"{title} — {data['total']} items", entries, _drive_result_notes(data), sep="\n\n"))
 
 @app.on_message(filters.command("E"))
 async def explore_cmd(client, message):
     if message.from_user.id not in allowed_users: return
-    try:
-        folder_id = message.command[1]
-        await explore_folder(client, message, folder_id)
-    except IndexError:
-        await message.reply("⚠️ **Format:** `/E [folder_id]`")
+    arg = " ".join(message.command[1:]).strip()
+    if not arg:
+        return await message.reply("⚠️ **Format:** `/E [folder ID / number / path]`\nExample: `/E 12345` or `/E /anime/abc`")
+    await explore_folder(client, message, arg)
 
-async def explore_folder(client, message, folder_id):
+async def explore_folder(client, message, folder_ref):
     cookies, key = load_cookies(message.from_user.id)
     if not key: return await message.reply("❌ Please `/login` first.")
-    
-    msg = await message.reply("🔎 *Fetching folder contents...*")
+
+    msg = await message.reply("🔎 Fetching folder contents...")
     loop = asyncio.get_event_loop()
-    subfolders, files, current_id = await loop.run_in_executor(None, get_cloud_folder_contents, folder_id, cookies, key)
-    
-    if current_id is None:
-        return await msg.edit("❌ **Error:** Could not locate folder.")
-        
-    text = f"📂 **Folder Contents** (ID: `{current_id}`)\n━━━━━━━━━━━━━━━━━━━━\n"
-    
-    if not subfolders and not files:
-        text += "📭 *Folder is empty.*\n"
-    else:
-        if subfolders:
-            text += "📁 **Subfolders:**\n"
-            for f in subfolders:
-                text += f" ├ 📁 {f.get('name')} \n │  └ ID: `{f.get('id')}` \n │  └ `/E {f.get('id')}` | `/deletefo {f.get('id')}`\n"
-        if files:
-            text += "\n📄 **Files:**\n"
-            for f in files:
-                sz = format_bytes(int(f.get('size', 0)))
-                text += f" ├ 📄 {f.get('name')} ({sz})\n │  └ ID: `{f.get('id')}` \n │  └ `/deletefi {f.get('id')}`\n"
-                
-    text += "\n━━━━━━━━━━━━━━━━━━━━\n"
-    text += "💡 *Use /E <id> to explore a folder.*\n"
-    text += "💡 *Use /deletefi <id> to delete a file.*\n"
-    text += "💡 *Use /deletefo <id> to delete a folder.*"
-    
-    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
-    await msg.edit(chunks[0])
-    for chunk in chunks[1:]:
-        await message.reply(chunk)
+    all_folders, root_id = await loop.run_in_executor(None, fetch_all_folders, cookies, key)
+    if not root_id:
+        return await msg.edit("❌ **Session expired or drive unreachable.** Please `/login` again.")
+    index = build_folder_index(all_folders, root_id)
+
+    status, matches = resolve_folder_query(folder_ref, index, root_id, prefer_id=True)
+    if status == "none":
+        return await msg.edit(f"❌ **Folder not found:** `{md_safe(str(folder_ref)[:60])}`\n"
+                              "Use the folder ID shown by `/checkallfolder`, or a path like `/anime/abc`.")
+    if status in ("multi", "fuzzy"):
+        pages = candidate_pages(matches, status, "👉 Open one with `/E <number>` or `/E <full path>`.")
+        return await _send_pages(client, message.chat.id, msg, pages)
+
+    target = matches[0]
+    fid = target["id"]
+    subs = [e for e in index if e["parent"] == fid]
+    files = await loop.run_in_executor(None, fetch_folder_files, fid, cookies, key)
+    files_failed = files is None
+    files = sorted(files or [], key=lambda f: _nat_key(f.get("name", "")))
+
+    def section(header, lines):
+        return [f"\n{header}\n{ln}" if i == 0 else ln for i, ln in enumerate(lines)]
+
+    entries = [f"📍 `{md_safe(target['path'])}` · 🆔 `{fid}`"]
+    if subs:
+        entries += section(f"📁 **Subfolders ({len(subs)})**",
+                           [f"📁 `{md_safe(e['name'])}` · 🆔 `{e['id']}`" for e in subs])
+    if files:
+        entries += section(f"📄 **Files ({len(files)})**",
+                           [f"📄 `{md_safe(f.get('name'))}` · {format_bytes(_to_int(f.get('size')))} · 🆔 `{f.get('id')}`" for f in files])
+    if files_failed:
+        entries.append("\n⚠️ Could not read the files of this folder. Try again.")
+    elif not subs and not files:
+        entries.append("\n📭 Folder is empty.")
+
+    footer = "💡 `/E <ID>` open · `/deletefi <ID>` delete file · `/deletefo <ID>` delete folder"
+    await _send_pages(client, message.chat.id, msg, make_pages("📂 **Folder Contents**", entries, footer))
 
 @app.on_message(filters.command("deletefi"))
 async def deletefi_cmd(client, message):
@@ -3171,41 +3551,332 @@ async def unsharefo_cmd(client, message):
         await msg.edit(f"❌ **Failed:**\nResponse: `{res_data}`")
 
 
-# --- FIND / SEARCH COMMAND ---
-@app.on_message(filters.command("find"))
+# --- DRIVE INVENTORY / SEARCH ---
+def _share_state(item):
+    """A missing flag is unknown, never a claim that there is no public link."""
+    item = _item_metadata(item)
+    for k in ("shared", "isshared", "ispublic", "haslink", "hasshare"):
+        if k in item and item[k] is not None:
+            value = item[k]
+            if isinstance(value, str):
+                if value.strip().lower() in ("false", "0", "no", "n", ""):
+                    return False
+                if value.strip().lower() in ("true", "1", "yes", "y"):
+                    return True
+                return None
+            return bool(value)
+    for k in ("sharedlink", "shareurl", "publicurl", "link"):
+        if k in item and item[k] is not None:
+            return bool(item[k])
+    return None
+
+
+def _public_link(item):
+    """Only expose actual share URLs, not private file/download URLs."""
+    for field in ("sharedlink", "shareurl", "publicurl", "link", "url"):
+        value = item.get(field)
+        if isinstance(value, str):
+            url = urljoin("https://cloud.jazzdrive.com.pk/", value)
+            parsed = urlparse(url)
+            if (parsed.scheme == "https" and parsed.hostname == "cloud.jazzdrive.com.pk"
+                    and parsed.path.startswith("/share/") and not parsed.username):
+                return url
+    return None
+
+
+def _fetch_existing_links(kind, cookies, key):
+    """Read-only link inventory, following the official client's cursor contract."""
+    links, seen_cursors, cursor = [], set(), None
+    with requests.Session() as session:
+        while True:
+            params = {"action": "get" if kind == "folder" else "list-media-sets", "validationkey": key}
+            if kind == "folder":
+                payload = {"cursor": cursor} if cursor is not None else {}
+                response = session.post("https://cloud.jazzdrive.com.pk/sapi/link", params=params,
+                                        json={"data": payload}, cookies=cookies,
+                                        headers=browser_like_headers(), timeout=25)
+            else:
+                if cursor is not None:
+                    params["cursor"] = cursor
+                response = session.get("https://cloud.jazzdrive.com.pk/sapi/media/set", params=params,
+                                       cookies=cookies, headers=browser_like_headers(), timeout=25)
+            data = _drive_data(response)
+            batch = data.get("links")
+            if not isinstance(batch, list) or any(not isinstance(x, dict) for x in batch):
+                raise ValueError("Missing links list")
+            links.extend(batch)
+            cursor = data.get("cursor")
+            if not cursor:
+                return links
+            if str(cursor) in seen_cursors:
+                raise ValueError("Drive repeated a link cursor")
+            seen_cursors.add(str(cursor))
+
+
+def _fetch_link_items(link, cookies, key):
+    if isinstance(link.get("items"), list):
+        return [link]
+    if link.get("id") is None:
+        raise ValueError("Missing link identity")
+    response = requests.get("https://cloud.jazzdrive.com.pk/sapi/media/set",
+                            params={"action": "get", "id": link["id"], "items": "true", "validationkey": key},
+                            cookies=cookies, headers=browser_like_headers(), timeout=25)
+    sets = _drive_data(response).get("sets")
+    if not isinstance(sets, list) or not sets:
+        raise ValueError("Missing link details")
+    return [{**link, **entry} for entry in sets]
+
+
+def _enrich_existing_links(results, cookies, key):
+    """Show existing links without creating public shares as a search side effect."""
+    warnings = []
+    folders = {r["id"]: r for r in results if r["kind"] == "folder"}
+    files = {r["id"]: r for r in results if r["kind"] == "file"}
+    if folders:
+        try:
+            links = _fetch_existing_links("folder", cookies, key)
+            linked = set()
+            for link in links:
+                fid = str(link.get("folderid"))
+                if fid in folders:
+                    linked.add(fid)
+                    folders[fid]["shared"] = True
+                    url = _public_link(link)
+                    if url:
+                        folders[fid]["links"].add(url)
+            for fid in folders.keys() - linked:
+                if folders[fid]["shared"] is None:
+                    folders[fid]["shared"] = False
+        except (requests.RequestException, ValueError, TypeError, KeyError):
+            warnings.append("⚠️ Folder link lookup failed; some link details are unavailable.")
+    if files:
+        try:
+            links = _fetch_existing_links("file", cookies, key)
+            def details(link):
+                try:
+                    return _fetch_link_items(link, cookies, key)
+                except (requests.RequestException, ValueError, TypeError, KeyError):
+                    return None
+            complete, linked = True, set()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                for sets in pool.map(details, links):
+                    if sets is None:
+                        complete = False
+                        continue
+                    for entry in sets:
+                        items = entry.get("items")
+                        if not isinstance(items, list):
+                            complete = False
+                            continue
+                        for item in items:
+                            fid = str(item.get("id")) if isinstance(item, dict) else str(item)
+                            if fid in files:
+                                linked.add(fid)
+                                files[fid]["shared"] = True
+                                url = _public_link(entry)
+                                if url:
+                                    files[fid]["links"].add(url)
+            if complete:
+                for fid in files.keys() - linked:
+                    if files[fid]["shared"] is None:
+                        files[fid]["shared"] = False
+            else:
+                warnings.append("⚠️ Some existing file links could not be read.")
+        except (requests.RequestException, ValueError, TypeError, KeyError):
+            warnings.append("⚠️ File link lookup failed; some link details are unavailable.")
+    return warnings
+
+
+def _search_hit(query, name, path, item_id):
+    if not query:
+        return True
+    q = query.strip().strip("`\"'").replace("\\", "/")
+    if q.isdigit():
+        return str(item_id) == q or q in _norm_text(name).split()
+    text = path if "/" in q else name
+    tokens, hay = _norm_text(q).split(), _norm_text(text)
+    # vphonegaga also finds 'VPhone GaGa'; punctuation/underscores are equivalent.
+    return bool(tokens) and (all(t in hay for t in tokens) or "".join(tokens) in hay.replace(" ", ""))
+
+
+def find_in_drive(query, cookies, key, kind=None):
+    """Full inventory first, deduplicate by stable ID, then search real paths.
+
+    kind=None combines folders/files; kind=folder never scans file endpoints.
+    No silent 40-result cap: every unique match is paginated for Telegram.
+    """
+    all_folders, root_id = fetch_all_folders(cookies, key)
+    if root_id is None:
+        return {"error": "session"}
+    index = build_folder_index(all_folders, root_id)
+    raw_by_id = {str(f.get("id")): f for f in all_folders}
+    path_of = {str(root_id): "/", **{e["id"]: e["path"] for e in index}}
+    results, failed, warnings = [], 0, []
+    missing_folders = set(raw_by_id) - set(path_of)
+    if missing_folders:
+        warnings.append(f"⚠️ INCOMPLETE: {len(missing_folders)} folder path(s) could not be resolved from the server tree.")
+    if kind != "file":
+        for e in index:
+            if _search_hit(query, e["name"], e["path"], e["id"]):
+                raw = raw_by_id.get(e["id"], {})
+                url = _public_link(raw)
+                results.append({"kind": "folder", "id": e["id"], "name": e["name"], "path": e["path"],
+                                "size": 0, "shared": _share_state(raw), "links": {url} if url else set(), "order": e["n"]})
+    if kind != "folder":
+        unique = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=FIND_SCAN_WORKERS) as pool:
+            listings = pool.map(lambda fid: fetch_folder_files(fid, cookies, key), path_of)
+            for fid, files in zip(path_of, listings):
+                if files is None:
+                    failed += 1
+                    continue
+                for raw in files:
+                    f = _item_metadata(raw)
+                    file_id = str(f["id"])
+                    parent = str(f["folderid"]) if f.get("folderid") is not None else fid
+                    if parent not in path_of:
+                        warnings.append("⚠️ Some file paths could not be resolved; retry after refreshing the drive.")
+                        continue
+                    if file_id not in unique:
+                        url = _public_link(f)
+                        unique[file_id] = {"kind": "file", "id": file_id, "name": str(f.get("name", "")),
+                                           "paths": set(), "size": _to_int(f.get("size")),
+                                           "shared": _share_state(f), "links": {url} if url else set()}
+                    unique[file_id]["paths"].add(path_of[parent])
+        for item in unique.values():
+            paths = sorted(item.pop("paths"), key=_nat_key)
+            item["path"] = " | ".join(paths)
+            if any(_search_hit(query, item["name"], path.rstrip("/") + "/" + item["name"], item["id"]) for path in paths):
+                results.append(item)
+    results.sort(key=lambda r: (r["kind"] != "folder", r.get("order", 0), _nat_key(r["path"]), _nat_key(r["name"]), r["id"]))
+    warnings.extend(_enrich_existing_links(results, cookies, key))
+    return {"results": results, "total": len(results), "scanned": len(path_of), "failed": failed,
+            "root_id": str(root_id), "warnings": list(dict.fromkeys(warnings))}
+
+
+def _find_entry(i, r):
+    st = r["shared"]
+    links = sorted(r.get("links", []))
+    link = "✅ Existing share link" if links else ("✅ Shared — URL unavailable" if st is True else (
+        "❌ No public share link" if st is False else "⚠️ Not verified — link lookup unavailable"))
+    lines = [f"**{i}.** {'📁' if r['kind'] == 'folder' else '📄'} `{md_safe(r['name'])}`",
+             f"   📍 `{md_safe(r['path'])}`"]
+    meta = f"   🆔 `{r['id']}`"
+    if r["size"]:
+        meta += f" · 🗜️ {format_bytes(r['size'])}"
+    lines += [meta, f"   🔗 **Link:** {link}"]
+    lines += [f"   {url}" for url in links]
+    return "\n".join(lines)
+
+
+def _drive_result_notes(data):
+    notes = ["💡 `/E <ID>` open folder · `/share <ID>` create a link",
+             "🔎 `/findfolder <name>` · `/findfile <name>` · `/find <name>` (both)"]
+    if data["failed"]:
+        notes.insert(0, f"⚠️ INCOMPLETE: {data['failed']} folder(s) could not be fully read — please retry.")
+    notes.extend(data.get("warnings", []))
+    notes.append("ℹ️ Existing links are listed, not created or checked for public accessibility.")
+    return "\n".join(notes)
+
+
+FIND_TXT_THRESHOLD = 50   # isse zyada results ho to .txt file me bhejo
+
+
+def _txt_link_line(r):
+    links = sorted(r.get("links", []))
+    if links:
+        return "Link: " + "  |  ".join(links)
+    st = r.get("shared")
+    if st is True:
+        return "Link: Shared (URL unavailable)"
+    if st is False:
+        return f"Link: No public link (use /share {r['id']} to create)"
+    return "Link: Not verified"
+
+
+def _write_find_txt(query, data, command):
+    """Find results ko clean plain-text file me likho, path return karo."""
+    import tempfile
+    results = data["results"]
+    folders = [r for r in results if r["kind"] == "folder"]
+    files = [r for r in results if r["kind"] == "file"]
+    bar = "=" * 60
+    out = [bar, f"SEARCH RESULTS FOR: {query}",
+           f"Date   : {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+           f"Total  : {len(results)}  (Folders: {len(folders)}, Files: {len(files)})",
+           bar, ""]
+    def block(title, items):
+        if not items:
+            return
+        out.extend([f"--- {title} ({len(items)}) ---", ""])
+        for i, r in enumerate(items, 1):
+            out.append(f"{i}. {r['name']}")
+            out.append(f"   Path: {r['path']}")
+            size = f"   Size: {format_bytes(r['size'])}" if r["size"] else None
+            out.append(f"   ID  : {r['id']}")
+            if size: out.append(size)
+            out.append(f"   {_txt_link_line(r)}")
+            out.append("")
+    block("FOLDERS", folders)
+    block("FILES", files)
+    if data.get("failed"):
+        out.append(f"NOTE: {data['failed']} folder(s) could not be fully read. Please retry.")
+    for w in data.get("warnings", []):
+        out.append(w)
+    safe_q = re.sub(r"[^\w\-]+", "_", query)[:30].strip("_") or "results"
+    fname = f"{command}_{safe_q}_{datetime.now().strftime('%H%M%S')}.txt"
+    path = os.path.join(tempfile.gettempdir(), fname)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out))
+    return path
+
+
+@app.on_message(filters.command(["find", "findfolder", "findfile"]))
 async def find_cmd(client, message):
     if message.from_user.id not in allowed_users: return
-    query = message.text.replace("/find", "", 1).strip().lower()
-    if not query: return await message.reply("⚠️ **Format:** `/find [Name or ID]`")
-        
+    command = message.command[0].split("@")[0].lower()
+    kind = {"findfolder": "folder", "findfile": "file"}.get(command)
+    parts = (message.text or "").split(None, 1)
+    query = parts[1].strip() if len(parts) > 1 else ""
+    if not query:
+        return await message.reply(f"⚠️ **Format:** `/{command} <name / path / ID>`")
     cookies, key = load_cookies(message.from_user.id)
     if not key: return await message.reply("❌ Please `/login` first.")
-    
-    msg = await message.reply(f"🔎 *Searching for `{query}`...*")
-    
-    def do_search():
-        session = requests.Session()
-        headers = {'User-Agent': 'Mozilla/5.0'}
+    q_show = md_safe(query[:40])
+    msg = await message.reply(f"🔎 Searching your drive for `{q_show}` ...")
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(None, find_in_drive, query, cookies, key, kind)
+    except Exception:
+        return await msg.edit("❌ Search failed. Please try again.")
+    if data.get("error"):
+        return await msg.edit("❌ Session expired or drive unreachable. Please `/login` again.")
+    # 50 se zyada results: Telegram pages ki jagah ek clean .txt file bhejo
+    if data["total"] > FIND_TXT_THRESHOLD:
+        txt_path = None
         try:
-            folders = session.get(f"https://cloud.jazzdrive.com.pk/sapi/media/folder?action=get&validationkey={key}", cookies=cookies, headers=headers, timeout=20).json().get('data', {}).get('folders', [])
-            matched = [f for f in folders if query in str(f.get('name', '')).lower() or query == str(f.get('id', ''))]
-            
-            f_ids = [int(f['id']) for f in folders if f.get('id')]
-            files = session.post(f"https://cloud.jazzdrive.com.pk/sapi/media/file?action=get&validationkey={key}", json={"data": {"folderids": f_ids}}, cookies=cookies, headers=headers, timeout=20).json().get('data', {}).get('files', [])
-            matched += [f for f in files if query in str(f.get('name', '')).lower() or query == str(f.get('id', ''))]
-            
-            for item in matched[:10]:
-                item['link'], item['link_id'] = generate_share_link(item['id'], 'folders' in str(item.get('id', '')), cookies, key)
-            return matched
-        except: return []
-
-    results = await asyncio.get_event_loop().run_in_executor(None, do_search)
-    if not results: return await msg.edit(f"📭 **No matches for:** `{query}`")
-            
-    text = f"🔍 **Matches for:** `{query}`\n━━━━━━━━━━━━━━━━━━━━\n"
-    for i, item in enumerate(results[:30], 1):
-        text += f"**{i}. {item.get('name')}**\n ├ 🆔 UID: `{item.get('id')}`\n └ 🔗 {item.get('link') or 'Click /share ' + str(item.get('id'))}\n\n"
-    await msg.edit(text, disable_web_page_preview=True)
+            txt_path = _write_find_txt(query, data, command)
+            n_fold = sum(1 for r in data["results"] if r["kind"] == "folder")
+            n_file = data["total"] - n_fold
+            caption = (f"🔍 **Results for** `{q_show}`\n"
+                       f"📊 {data['total']} matches · 📁 {n_fold} folders · 📄 {n_file} files\n"
+                       f"🔗 Share links (jahan maujood hain) file ke andar hain.")
+            if data["failed"]:
+                caption += f"\n⚠️ {data['failed']} folder(s) fully read nahi hue — dobara try karein."
+            await client.send_document(message.chat.id, txt_path, caption=caption)
+            try: await msg.delete()
+            except Exception: pass
+            return
+        except Exception as e:
+            print(f"find txt send failed: {e}")
+            # fallback: neeche normal pages
+        finally:
+            if txt_path and os.path.exists(txt_path):
+                try: os.remove(txt_path)
+                except OSError: pass
+    entries = [_find_entry(i, r) for i, r in enumerate(data["results"], 1)] or ["📭 No matching items in the folders successfully read."]
+    await _send_pages(client, message.chat.id, msg, make_pages(
+        f"🔍 **Results for** `{q_show}` — {data['total']} unique matches",
+        entries, _drive_result_notes(data), sep="\n\n"))
 
 @app.on_message(filters.command("status"))
 async def status_cmd(client, message):
@@ -3559,6 +4230,8 @@ async def text_handler(client, message):
         user_states[message.from_user.id] = None
         if not login_events[message.from_user.id].done():
             login_events[message.from_user.id].set_result(message.text)
+    elif isinstance(state, dict) and state.get("action") == "WAITING_FOR_DEST_FOLDER":
+        await handle_dest_folder_input(client, message, state)
     elif isinstance(state, dict) and state.get("action") == "WAITING_FOR_BATCH_NAME":
         state["data"]["batch_name"] = message.text
         user_states[message.from_user.id] = None
@@ -3627,39 +4300,121 @@ async def folder_choice_callback(client, query):
     await check_login_and_ask_folder(client, query.message, user_id, job_data)
 
 async def check_login_and_ask_folder(client, message, user_id, job_data):
+    """Upload ka destination poochho: pura folder list (4000-char pages, naam kabhi nahi katta),
+    phir user folder ka naam / order number / path (/anime/abc) likh kar chunta hai."""
     cookies, key = load_cookies(user_id)
     if not key: return await message.reply("❌ Please `/login` first.")
-    
+
+    # pehli folder-list ke pages (agar hain) saaf karo
+    await _delete_msgs(client, message.chat.id, job_data.pop("list_msg_ids", None))
+
     msg = await message.reply("🔎 *Retrieving cloud directories...*")
-    folders, root_id = await asyncio.get_event_loop().run_in_executor(None, get_cloud_folders, cookies, key)
-    
+    loop = asyncio.get_event_loop()
+    all_folders, root_id = await loop.run_in_executor(None, fetch_all_folders, cookies, key)
     if not root_id: return await msg.edit("❌ **Session Expired!** Please `/login` again.")
+    index = build_folder_index(all_folders, root_id)
 
     job_id = str(uuid.uuid4())[:8]
-    if user_id not in user_pending_jobs: user_pending_jobs[user_id] = {}
-    job_data["dest_names"] = {str(root_id): "/", **{str(fid): f"/{fname}" for fname, fid in folders}}
-    user_pending_jobs[user_id][job_id] = job_data
+    job_data["dest_names"] = {str(root_id): "/", **{e["id"]: e["path"] for e in index}}
+    job_data["folder_index"] = index
+    job_data["root_id"] = str(root_id)
+    user_pending_jobs.setdefault(user_id, {})[job_id] = job_data
 
-    # --- NEW: Added Create Folder Button ---
-    buttons = [
-        [InlineKeyboardButton("🏠 ROOT Directory", callback_data=f"up_{root_id}_{job_id}")],
-        [InlineKeyboardButton("➕ Create New Folder", callback_data=f"createnewfol_{root_id}_{job_id}")]
-    ]
-    row = []
-    for fname, fid in folders:
-        row.append(InlineKeyboardButton(f"📁 {fname}", callback_data=f"up_{fid}_{job_id}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row: buttons.append(row)
-    
+    bname = md_safe(job_data.get("batch_name", ""))
     if job_data.get("skip_folder"):
-        prompt = "✅ Select the **existing folder** to upload your files into:"
+        purpose = "Your files will be uploaded **directly into** the folder you choose."
     elif job_data.get("is_batch"):
-        prompt = f"✅ Select where to create the new folder **{job_data['batch_name']}**:"
+        purpose = f"The new folder `{bname}` will be created **inside** the folder you choose."
     else:
-        prompt = f"✅ Select destination for **{job_data['batch_name']}**:"
-    await msg.edit(prompt, reply_markup=InlineKeyboardMarkup(buttons))
+        purpose = f"`{bname}` will be uploaded into the folder you choose."
+
+    count = len(index)
+    entries = [f"**{e['n']}.** 📁 `{md_safe(e['path'])}`" for e in index]
+    if not entries:
+        entries = ["📭 No folders yet — only Root exists. Press **Root** or create a new folder."]
+    title = f"📁 **Choose Destination** — {count} folder{'s' if count != 1 else ''}"
+    footer = (
+        "✍️ **Now send the destination folder:**\n"
+        "• its **name** — `anime`\n"
+        "• its **order number** — `3`\n"
+        "• its **path** — `/anime/abc`\n"
+        "• `/` — the Root folder\n\n"
+        f"{purpose}\n"
+        "Type `cancel` to stop."
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏠 Root", callback_data=f"up_{root_id}_{job_id}"),
+         InlineKeyboardButton("➕ New Folder", callback_data=f"createnewfol_{root_id}_{job_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"destcancel_{job_id}")],
+    ])
+    job_data["list_msg_ids"] = await _send_pages(client, message.chat.id, msg, make_pages(title, entries, footer), markup)
+    user_states[user_id] = {"action": "WAITING_FOR_DEST_FOLDER", "data": {"job_id": job_id}}
+
+async def handle_dest_folder_input(client, message, state):
+    """User ne destination likha (name / number / path) -> folder dhoondo -> upload shuru."""
+    user_id = message.from_user.id
+    job_id = state["data"]["job_id"]
+    job_data = user_pending_jobs.get(user_id, {}).get(job_id)
+    if not job_data:
+        user_states[user_id] = None
+        return await message.reply("⚠️ Session expired. Please send the upload command again.")
+
+    text = (message.text or "").strip()
+    if text.lower() in ("cancel", "stop", "exit"):
+        user_states[user_id] = None
+        user_pending_jobs.get(user_id, {}).pop(job_id, None)
+        await _delete_msgs(client, message.chat.id, job_data.pop("list_msg_ids", None))
+        return await message.reply("↩️ Cancelled — nothing was uploaded.")
+
+    cands = state["data"].get("candidates")
+    if cands and text.strip().strip("`'\"").isdigit():
+        n = int(text.strip().strip("`'\""))
+        if n in cands:
+            e = job_data["folder_index"][n - 1]
+            user_states[user_id] = None
+            try: await message.delete()
+            except Exception: pass
+            await _delete_msgs(client, message.chat.id, job_data.pop("list_msg_ids", None))
+            return await launch_upload(client, user_id, job_id, int(e["id"]))
+        return await message.reply(
+            f"⚠️ `{n}` is not one of the matches above. Send one of: {', '.join(str(c) for c in sorted(cands))} "
+            "— or type a different name / path, or `cancel`.")
+
+    status, matches = resolve_folder_query(text, job_data.get("folder_index", []), job_data.get("root_id"))
+    if status == "ok":
+        user_states[user_id] = None
+        try: await message.delete()
+        except Exception: pass
+        await _delete_msgs(client, message.chat.id, job_data.pop("list_msg_ids", None))
+        return await launch_upload(client, user_id, job_id, int(matches[0]["id"]))
+
+    if status == "none":
+        return await message.reply(
+            f"❌ **No folder found** for `{md_safe(text[:60])}`\n"
+            "Send the folder **name**, its **order number** from the list, or a path like `/anime/abc`.\n"
+            "Type `cancel` to stop.")
+
+    state["data"]["candidates"] = {m["n"] for m in matches[:25]}
+    pages = candidate_pages(matches, status, "👉 Send the **order number** (or the full path) of the folder you want.")
+    for p in pages:
+        await message.reply(p, disable_web_page_preview=True)
+
+@app.on_callback_query(filters.regex(r"^destcancel_"))
+async def dest_cancel_callback(client, query):
+    user_id = query.from_user.id
+    if user_id not in allowed_users: return await query.answer("Unauthorized", show_alert=True)
+    job_id = query.data.split("_", 1)[1]
+    job_data = user_pending_jobs.get(user_id, {}).pop(job_id, None)
+    st = user_states.get(user_id)
+    if isinstance(st, dict) and st.get("action") in ("WAITING_FOR_DEST_FOLDER", "WAITING_FOR_NEW_FOLDER"):
+        user_states[user_id] = None
+    chat_id = query.message.chat.id
+    if job_data:
+        await _delete_msgs(client, chat_id, job_data.pop("list_msg_ids", None))
+    try: await query.message.delete()
+    except Exception: pass
+    await query.answer("Cancelled")
+    await client.send_message(chat_id, "↩️ Cancelled — nothing was uploaded.")
 
 # --- NEW: Create Folder UI Callbacks ---
 @app.on_callback_query(filters.regex(r"^(createnewfol_|cancelnewfol_)"))
@@ -3694,22 +4449,35 @@ async def handle_new_folder_callbacks(client, query):
 
 @app.on_callback_query(filters.regex(r"^up_"))
 async def folder_selected(client, query):
+    """Root button (ya purani list ke button) dabaya."""
     user_id = query.from_user.id
     if user_id not in allowed_users: return await query.answer("Unauthorized", show_alert=True)
-    
+
     parts = query.data.split("_")
     folder_id, job_id = int(parts[1]), parts[2]
+    job_data = user_pending_jobs.get(user_id, {}).get(job_id)
+    if not job_data: return await query.answer("⚠️ Session expired.", show_alert=True)
+
+    st = user_states.get(user_id)
+    if isinstance(st, dict) and st.get("action") == "WAITING_FOR_DEST_FOLDER":
+        user_states[user_id] = None
+    await _delete_msgs(client, query.message.chat.id, job_data.pop("list_msg_ids", None))
+    try: await query.message.delete()
+    except Exception: pass
+    await query.answer()
+    await launch_upload(client, user_id, job_id, folder_id)
+
+
+async def launch_upload(client, user_id, job_id, folder_id):
+    """Destination chun li gayi — upload shuru (hosting ya GitHub runner)."""
     data = user_pending_jobs.get(user_id, {}).pop(job_id, None)
-    
-    if not data: return await query.answer("⚠️ Session expired.", show_alert=True)
-    
+    if not data:
+        return await client.send_message(user_id, "⚠️ Session expired. Please send the upload command again.")
+
     batch_name, is_batch = data.get("batch_name", "Uploads"), data.get("is_batch", False)
     cookies, key = load_cookies(user_id)
     loop = asyncio.get_event_loop()
-    
-    try: await query.message.delete()
-    except Exception: pass
-    
+
     tasks_list = data.get("links", [])
     if not tasks_list:
         s_id, e_id = sorted([data["start_msg_id"], data["end_msg_id"]])
@@ -3720,6 +4488,7 @@ async def folder_selected(client, query):
 
     new_folder = bool(is_batch and not data.get("skip_folder"))
     dest_path = data.get("dest_names", {}).get(str(folder_id), "/")
+    await client.send_message(user_id, f"📍 **Destination:** `{md_safe(dest_path)}`")
 
     # 🐙 GitHub mode ON ho to download + upload runner par (batch folder bhi runner banata hai)
     if await gh_try_dispatch(client, user_id, job_id, tasks_list, folder_id, is_batch, batch_name, cookies, key, dest_path, new_folder):
@@ -3850,7 +4619,9 @@ async def run_pipeline(client, user_id, job_id, tasks_list, target_folder_id, is
                             except Exception as up_err:
                                 if task_id in cancelled_tasks: raise asyncio.CancelledError()
                                 print(f"Part {p['index']} upload error: {up_err}")
+                                UPLOAD_ERRORS[p["path"]] = f"{type(up_err).__name__}: {str(up_err)[:150]}"
                                 ok, fid = False, None
+                            part_reason = UPLOAD_ERRORS.pop(p["path"], None)
                             try: os.remove(p["path"])
                             except OSError: pass
                             remaining -= p["size"]
@@ -3861,15 +4632,24 @@ async def run_pipeline(client, user_id, job_id, tasks_list, target_folder_id, is
                                 for q in parts:      # baqi parts: upload hi nahi hue
                                     if q["index"] > p["index"]:
                                         tracker.set_part_status(task_id, q["index"], "skipped")
-                                raise PartUploadFailed(p["index"], len(parts))
+                                if part_reason: print(f"Part {p['index']} failed: {part_reason}", flush=True)
+                                raise PartUploadFailed(p["index"], len(parts), part_reason)
                             tracker.set_part_status(task_id, p["index"], "uploaded",
                                                     file_id=fid, uploaded_at=time.time())
                         split_done = True
                     else:
                         # ── NORMAL (<= 2GB): purana flow ──────────────────────────
                         prog = lambda cur, tot: asyncio.run_coroutine_threadsafe(tracker.update_ul(task_id, cur, tot), loop)
-                        success, file_id = await loop.run_in_executor(None, functools.partial(
-                            upload_file_sync, local_path, safe_filename, fsize, target_folder_id, cookies, key, prog, is_cancelled))
+                        try:
+                            success, file_id = await loop.run_in_executor(None, functools.partial(
+                                upload_file_sync, local_path, safe_filename, fsize, target_folder_id, cookies, key, prog, is_cancelled))
+                        except Exception as up_err:
+                            if task_id in cancelled_tasks: raise asyncio.CancelledError()
+                            UPLOAD_ERRORS[local_path] = f"{type(up_err).__name__}: {str(up_err)[:150]}"
+                            success, file_id = False, None
+                        if not (success and file_id):
+                            task_error = f"Upload failed — {UPLOAD_ERRORS.pop(local_path, None) or 'server did not accept the file'}"
+                            print(f"[{task_id}] {task_error}", flush=True)
                 except asyncio.CancelledError:
                     raise
                 except SplitDeclined:
@@ -3877,7 +4657,7 @@ async def run_pipeline(client, user_id, job_id, tasks_list, target_folder_id, is
                 except SplitError as e:
                     task_error = msg_split_failed(e)
                 except PartUploadFailed as e:
-                    task_error = msg_part_failed(e.index, e.total)
+                    task_error = msg_part_failed(e.index, e.total, e.reason)
                 except StorageTooBig as e:
                     task_error = msg_storage_too_big(e.need, e.limit)
                 except StorageExceeded:
@@ -3960,6 +4740,7 @@ async def run_pipeline(client, user_id, job_id, tasks_list, target_folder_id, is
         await asyncio.sleep(1)
     try: await status_msg.delete()
     except Exception: pass
+    await tracker.cleanup()
 
 
 # --- BACKGROUND AUTO PING TASK ---
