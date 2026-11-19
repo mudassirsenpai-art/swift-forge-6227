@@ -20,13 +20,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-          sparse-checkout: jazz_runner
 
-      - name: Free disk space (background)
+      - name: Free disk space
         run: |
-          nohup sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/local/share/boost /opt/hostedtoolcache/CodeQL >/dev/null 2>&1 &
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
           df -h / | tail -1
 
       - name: Setup Python
@@ -35,7 +32,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -q --disable-pip-version-check --prefer-binary pyrogram tgcrypto requests requests-toolbelt nest-asyncio aiohttp aiofiles cryptography
+        run: pip install -q pyrogram tgcrypto requests requests-toolbelt nest-asyncio aiohttp aiofiles cryptography
 
       - name: Download + upload to Jazz Drive
         working-directory: jazz_runner
