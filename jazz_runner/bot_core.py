@@ -88,6 +88,8 @@ def set_active_phone(user_id, phone):
 def get_active_phone(user_id):
     return read_db()["active_accounts"].get(str(user_id))
 
+DEVID_COOKIE = "_deviceid"   # login ka X-deviceid; asli cookie nahi, sirf header banane ke liye
+
 def save_cookies(user_id, phone, formatted_cookies, val_key):
     db = read_db()
     session_id = f"{user_id}_{phone}"
@@ -824,12 +826,18 @@ def upload_file_sync(local_path, name, size, folder_id, cookies, key, on_progres
     mime = mimetypes.guess_type(name)[0] or 'application/octet-stream'
     url = f"https://cloud.jazzdrive.com.pk/sapi/upload?action=save&acceptasynchronous=true&validationkey={key}"
     UPLOAD_ERRORS.pop(local_path, None)
+    cookies = dict(cookies or {})
+    device_id = cookies.pop(DEVID_COOKIE, None)
     last_err = "unknown error"
 
     for attempt in range(1, 4):
         metadata = {"name": name, "size": str(size), "folderid": str(folder_id), "contenttype": mime,
                     "modificationdate": datetime.now().strftime("%Y%m%dT%H%M%SZ")}
-        headers = {'User-Agent': 'Mozilla/5.0', 'Connection': 'keep-alive'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+                   'Connection': 'keep-alive', 'Origin': 'https://cloud.jazzdrive.com.pk',
+                   'Referer': 'https://cloud.jazzdrive.com.pk/'}
+        if device_id:
+            headers['X-deviceid'] = device_id
 
         def _cb(monitor_obj):
             if is_cancelled and is_cancelled():
@@ -861,6 +869,19 @@ def upload_file_sync(local_path, name, size, folder_id, cookies, key, on_progres
                 print(f"[UPLOAD] {name[:40]} attempt {attempt}: {last_err}", flush=True)
                 break    # server ne jawab de diya — dobara bhejne se duplicate ban sakta hai
             last_err = f"HTTP {res.status_code}: {snippet or '<empty>'}"
+            if res.status_code in (401, 403):
+                try:
+                    chk = requests.get(f"https://cloud.jazzdrive.com.pk/sapi/profile?action=get&validationkey={key}",
+                                       cookies=cookies, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+                    alive = chk.status_code == 200 and '"user"' in chk.text
+                except Exception:
+                    alive = None
+                if alive is False:
+                    last_err = "session expired — please /login again"
+                elif not device_id:
+                    last_err = "upload rejected (401) — old login has no device id, please /login again"
+                else:
+                    last_err = f"upload rejected ({res.status_code}) although session is alive"
             print(f"[UPLOAD] {name[:40]} attempt {attempt}: {last_err}", flush=True)
             if res.status_code < 500:
                 break    # 4xx (session expired / bad request) retry se theek nahi hota
@@ -2387,6 +2408,7 @@ async def do_api_login(client, message, number, user_id):
                 formatted_cookies.append({"name": "validationKey", "value": val_key, "domain": "cloud.jazzdrive.com.pk", "path": "/"})
             
             # --- LOCAL DB SAVING ---
+            formatted_cookies.append({"name": DEVID_COOKIE, "value": dynamic_device_id, "domain": "cloud.jazzdrive.com.pk", "path": "/"})
             save_cookies(user_id, number, formatted_cookies, val_key)
             return await msg.edit(f"✅ **Login Successful!**\nNumber `{number}` is added and set as ACTIVE account.")
             
